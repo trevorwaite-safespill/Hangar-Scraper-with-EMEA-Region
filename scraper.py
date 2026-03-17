@@ -1075,9 +1075,13 @@ def main():
                 all_rows.append(row)
         time.sleep(1)
 
-    # 2. SAM.gov
-    log.info("[NA] Searching SAM.gov ...")
-    all_rows.extend(samgov_search(start_date, end_date))
+    # 2. SAM.gov (uses longer 30-day lookback to catch infrequently posted contracts)
+    sam_end   = datetime.date.today()
+    sam_start = sam_end - datetime.timedelta(days=SAM_LOOKBACK_DAYS)
+    sam_start_str = sam_start.strftime("%Y-%m-%d")
+    sam_end_str   = sam_end.strftime("%Y-%m-%d")
+    log.info("[NA] Searching SAM.gov (past %d days) ...", SAM_LOOKBACK_DAYS)
+    all_rows.extend(samgov_search(sam_start_str, sam_end_str))
 
     # 3. CanadaBuys
     log.info("[NA] Searching CanadaBuys ...")
