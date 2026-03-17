@@ -79,6 +79,9 @@ SAM_KEYWORDS = [
 
 LOOKBACK_DAYS = 7
 
+# SAM.gov uses a longer lookback since contracts are posted infrequently
+SAM_LOOKBACK_DAYS = 30
+
 # --- EMEA Search configuration -----------------------------------------------
 EMEA_SEARCH_QUERIES = [
     # New construction & development
@@ -1136,3 +1139,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
