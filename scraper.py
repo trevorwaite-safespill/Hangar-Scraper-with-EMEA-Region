@@ -82,22 +82,44 @@ LOOKBACK_DAYS = 7
 # --- EMEA Search configuration -----------------------------------------------
 EMEA_SEARCH_QUERIES = [
     # New construction & development
-    "new aircraft hangar construction Europe",
-    "hangar development project announced Middle East",
-    "airport hangar expansion Africa",
-    "hangar construction contract awarded EMEA",
-    "new FBO hangar development Europe",
-    # MRO & retrofit
-    "MRO facility construction Europe",
-    "aircraft hangar retrofit Middle East",
-    "hangar renovation contract Africa",
-    "hangar fire suppression upgrade Europe",
+    "new aircraft hangar construction",
+    "hangar development project announced",
+    "airport hangar expansion planned",
+    "hangar construction contract awarded",
+    "new FBO hangar development",
+    "aircraft maintenance hangar project",
+    # MRO facilities
+    "MRO facility construction",
+    "MRO hangar project",
+    "aircraft maintenance facility construction",
+    "MRO centre expansion",
+    # Retrofit & upgrades
+    "hangar retrofit project",
+    "hangar renovation contract",
+    "hangar fire suppression upgrade",
+    "hangar fire protection upgrade",
     # Fire protection specific
-    "hangar fire protection system Europe",
-    "aircraft hangar fire suppression Middle East",
-    # Military
-    "military hangar construction Europe",
-    "air force hangar project NATO",
+    "hangar fire protection system",
+    "aircraft hangar fire suppression project",
+    "hangar foam suppression system",
+    # Military & government
+    "military hangar construction contract",
+    "air force hangar project",
+    "NATO hangar construction",
+    "defence hangar project",
+    # Region-specific with city/country names
+    "hangar construction Dubai",
+    "hangar project UAE",
+    "aircraft hangar Nigeria",
+    "MRO facility Africa",
+    "hangar construction UK",
+    "aircraft maintenance hangar Germany",
+    "hangar project Saudi Arabia",
+    "MRO facility Middle East",
+    "hangar construction Poland",
+    "aircraft hangar Turkey",
+    "MRO hangar Kenya",
+    "aviation facility South Africa",
 ]
 
 # EMEA news domains extracted from known relevant sources
@@ -198,7 +220,7 @@ def fetch_article_meta(url: str) -> dict:
       - state         (str or "")
     Returns a dict with those three keys.
     """
-    result = {"publish_date": "", "country": "", "state": ""}
+    result = {"publish_date": "", "location": "", "state": ""}
     try:
         r = requests.get(url, headers=HEADERS_UA, timeout=15, allow_redirects=True)
         if r.status_code != 200:
@@ -254,9 +276,7 @@ def fetch_article_meta(url: str) -> dict:
     # --- Extract location from full page text --------------------------------
     # Use a larger chunk of visible text for better location detection
     visible = re.sub(r'<[^>]+>', ' ', html)
-    country, state = detect_location(visible[:30_000])
-    result["country"] = country
-    result["state"]   = state
+    result["country"] = detect_location(visible[:30_000])
 
     return result
 
@@ -311,16 +331,14 @@ def parse_serpapi_result(item: dict) -> dict | None:
     # Fallback date/location from snippet (will be overwritten by page fetch)
     date_raw         = item.get("date", "")
     fallback_date    = parse_google_date(date_raw)
-    country, state   = detect_location(snippet + " " + title)
+    location = detect_location(snippet + " " + title)
 
     return {
         "Project Title":  title,
         "Source URL":     link,
         "Summary":        snippet,
         "Date Published": fallback_date,
-        "Region":         "NA",
-        "Country":        country,
-        "State":          state,
+        "Location":       location,
         "Source":         "news",
     }
 
@@ -362,9 +380,7 @@ def enrich_with_page_data(rows: list[dict]) -> list[dict]:
         if meta["publish_date"]:
             row["Date Published"] = meta["publish_date"]
         if meta["country"]:
-            row["Country"] = meta["country"]
-        if meta["state"]:
-            row["State"] = meta["state"]
+            row["Location"] = meta["country"]
         time.sleep(0.5)   # be polite
     return rows
 
@@ -447,8 +463,7 @@ def parse_sam_result(opp: dict) -> dict | None:
         "Summary":        desc.strip()[:300] if desc else "",
         "Date Published": posted,
         "Region":         "NA",
-        "Country":        country_name,
-        "State":          state_code,
+        "Location":       location,
         "Source":         "sam_gov",
     }
 
@@ -522,8 +537,7 @@ def canadabuys_search(start_date: str) -> list[dict]:
                 "Summary":        desc[:300] if desc else "",
                 "Date Published": pub_date,
                 "Region":         "NA",
-                "Country":        "Canada",
-                "State":          "",
+                "Location":       "Canada",
                 "Source":         "canadabuys",
             })
 
@@ -593,9 +607,7 @@ def austender_search(start_date: str, end_date: str) -> list[dict]:
                 "Source URL":     url,
                 "Summary":        desc[:300] if desc else "",
                 "Date Published": pub_date,
-                "Region":         "AU",
-                "Country":        "Australia",
-                "State":          "",
+                "Location":       "Australia",
                 "Source":         "austender",
             })
 
@@ -666,7 +678,7 @@ def ted_europa_search(start_date: str, end_date: str) -> list[dict]:
                     "Source URL":     url,
                     "Summary":        summary.strip()[:300] if summary else "",
                     "Date Published": pub_date,
-                    "Country":        "Europe",
+                    "Location":        "Europe",
                     "Source":         "ted_europa",
                 })
 
@@ -712,22 +724,118 @@ MX_STATES = {
     "Veracruz","Yucatan","Zacatecas",
 }
 
-def detect_location(text: str) -> tuple[str, str]:
+# European countries
+EUROPE_COUNTRIES = [
+    "Albania","Andorra","Armenia","Austria","Azerbaijan","Belarus","Belgium",
+    "Bosnia and Herzegovina","Bulgaria","Croatia","Cyprus","Czech Republic",
+    "Czechia","Denmark","Estonia","Finland","France","Georgia","Germany",
+    "Greece","Hungary","Iceland","Ireland","Italy","Kazakhstan","Kosovo",
+    "Latvia","Liechtenstein","Lithuania","Luxembourg","Malta","Moldova",
+    "Monaco","Montenegro","Netherlands","North Macedonia","Norway","Poland",
+    "Portugal","Romania","Russia","San Marino","Serbia","Slovakia","Slovenia",
+    "Spain","Sweden","Switzerland","Turkey","Ukraine","United Kingdom",
+    "Vatican","England","Scotland","Wales","Northern Ireland",
+    # Major European cities that commonly appear in articles
+    "London","Paris","Berlin","Madrid","Rome","Amsterdam","Brussels",
+    "Vienna","Warsaw","Prague","Budapest","Bucharest","Stockholm","Oslo",
+    "Copenhagen","Helsinki","Athens","Lisbon","Dublin","Zurich","Geneva",
+    "Munich","Frankfurt","Hamburg","Barcelona","Milan","Naples","Turin",
+    "Schiphol","Heathrow","Gatwick","Stansted","Luton","Birmingham",
+    "Tewkesbury","Gloucester","Powidz","Larnaca","Nicosia",
+]
+
+# Middle Eastern countries and cities
+MIDDLE_EAST_COUNTRIES = [
+    "Bahrain","Cyprus","Egypt","Iran","Iraq","Israel","Jordan","Kuwait",
+    "Lebanon","Oman","Palestine","Qatar","Saudi Arabia","Syria",
+    "United Arab Emirates","UAE","Yemen",
+    # Major cities
+    "Dubai","Abu Dhabi","Doha","Riyadh","Jeddah","Muscat","Manama",
+    "Amman","Beirut","Tel Aviv","Cairo","Kuwait City","Dubai South",
+    "Mohammed bin Rashid","Sharjah","Ras Al Khaimah",
+]
+
+# African countries and cities
+AFRICA_COUNTRIES = [
+    "Algeria","Angola","Benin","Botswana","Burkina Faso","Burundi",
+    "Cameroon","Cape Verde","Central African Republic","Chad","Comoros",
+    "Congo","Ivory Coast","Djibouti","Egypt","Equatorial Guinea","Eritrea",
+    "Eswatini","Ethiopia","Gabon","Gambia","Ghana","Guinea","Guinea-Bissau",
+    "Kenya","Lesotho","Liberia","Libya","Madagascar","Malawi","Mali",
+    "Mauritania","Mauritius","Morocco","Mozambique","Namibia","Niger",
+    "Nigeria","Rwanda","Sao Tome","Senegal","Seychelles","Sierra Leone",
+    "Somalia","South Africa","South Sudan","Sudan","Tanzania","Togo",
+    "Tunisia","Uganda","Zambia","Zimbabwe",
+    # Major cities
+    "Lagos","Abuja","Nairobi","Johannesburg","Cape Town","Accra","Addis Ababa",
+    "Dar es Salaam","Casablanca","Tunis","Algiers","Kampala","Dakar",
+    "Anambra","Enugu","Kano","Port Harcourt",
+]
+
+# Asian countries relevant to aviation (for Asia-Pacific results)
+ASIA_COUNTRIES = [
+    "Afghanistan","Bangladesh","Bhutan","Brunei","Cambodia","China",
+    "India","Indonesia","Japan","Laos","Malaysia","Maldives","Mongolia",
+    "Myanmar","Nepal","North Korea","Pakistan","Philippines","Singapore",
+    "South Korea","Sri Lanka","Taiwan","Thailand","Timor-Leste","Vietnam",
+    "Australia","New Zealand","Papua New Guinea","Fiji",
+    # Major cities
+    "Beijing","Shanghai","Tokyo","Seoul","Singapore City","Mumbai","Delhi",
+    "Bangkok","Jakarta","Kuala Lumpur","Manila","Karachi","Dhaka",
+    "Hong Kong","Taipei","Colombo","Kathmandu","Yangon","Phnom Penh",
+    "Ho Chi Minh","Hanoi","Kochi","Kerala","Larnaca",
+]
+
+def detect_location(text: str) -> str:
+    """
+    Detect the most specific location mentioned in the text.
+    Returns a location string (country, city, or region).
+    Checks EMEA regions before defaulting to North America.
+    """
     lower = text.lower()
+
+    # Check Middle East first (before Africa/Europe to catch UAE, Dubai etc.)
+    for place in sorted(MIDDLE_EAST_COUNTRIES, key=len, reverse=True):
+        if place.lower() in lower:
+            return place
+
+    # Check Africa
+    for place in sorted(AFRICA_COUNTRIES, key=len, reverse=True):
+        if place.lower() in lower:
+            return place
+
+    # Check Europe
+    for place in sorted(EUROPE_COUNTRIES, key=len, reverse=True):
+        if place.lower() in lower:
+            return place
+
+    # Check Asia-Pacific
+    for place in sorted(ASIA_COUNTRIES, key=len, reverse=True):
+        if place.lower() in lower:
+            return place
+
+    # Check Canada
+    CA_PROVINCES_LIST = sorted(CA_PROVINCES, key=len, reverse=True)
     if "canada" in lower:
-        for prov in CA_PROVINCES:
+        for prov in CA_PROVINCES_LIST:
             if prov.lower() in lower:
-                return "Canada", prov
-        return "Canada", ""
+                return "Canada - " + prov
+        return "Canada"
+
+    # Check Mexico
+    MX_STATES_LIST = sorted(MX_STATES, key=len, reverse=True)
     if "mexico" in lower:
-        for st in MX_STATES:
+        for st in MX_STATES_LIST:
             if st.lower() in lower:
-                return "Mexico", st
-        return "Mexico", ""
+                return "Mexico - " + st
+        return "Mexico"
+
+    # Check US states
     for st in sorted(US_STATES, key=len, reverse=True):
         if st.lower() in lower:
-            return "United States", st
-    return "United States", ""
+            return "United States"
+
+    return ""
 
 
 # --- Deduplication -----------------------------------------------------------
@@ -749,12 +857,12 @@ def deduplicate(rows: list[dict]) -> list[dict]:
 
 HEADERS = [
     "Project Title", "Source URL", "Summary",
-    "Date Published", "Country",
+    "Date Published", "Location",
 ]
 
 COL_WIDTHS = {
     "Project Title":  40, "Source URL": 50, "Summary": 60,
-    "Date Published": 15, "Country": 20,
+    "Date Published": 15, "Location": 20,
 }
 
 HEADER_FILL  = PatternFill("solid", fgColor="1F3864")
