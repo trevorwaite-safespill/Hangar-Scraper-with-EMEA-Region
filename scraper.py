@@ -838,6 +838,88 @@ def detect_location(text: str) -> str:
     return ""
 
 
+
+
+# --- Location classification -------------------------------------------------
+
+NA_LOCATIONS = {
+    "United States", "Canada", "Mexico",
+    # US states
+    "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut",
+    "Delaware","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa",
+    "Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan",
+    "Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada",
+    "New Hampshire","New Jersey","New Mexico","New York","North Carolina",
+    "North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island",
+    "South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
+    "Virginia","Washington","West Virginia","Wisconsin","Wyoming",
+    # Canadian provinces
+    "Alberta","British Columbia","Manitoba","New Brunswick",
+    "Newfoundland and Labrador","Nova Scotia","Ontario",
+    "Prince Edward Island","Quebec","Saskatchewan",
+    "Northwest Territories","Nunavut","Yukon",
+    # Mexican states
+    "Aguascalientes","Baja California","Baja California Sur","Campeche",
+    "Chiapas","Chihuahua","Coahuila","Colima","Durango","Guanajuato",
+    "Guerrero","Hidalgo","Jalisco","Mexico City","Michoacan","Morelos",
+    "Nayarit","Nuevo Leon","Oaxaca","Puebla","Queretaro","Quintana Roo",
+    "San Luis Potosi","Sinaloa","Sonora","Tabasco","Tamaulipas","Tlaxcala",
+    "Veracruz","Yucatan","Zacatecas",
+}
+
+# Locations that are clearly EMEA — used to catch misclassified NA articles
+EMEA_LOCATIONS = set(
+    EUROPE_COUNTRIES + MIDDLE_EAST_COUNTRIES + AFRICA_COUNTRIES
+)
+
+def classify_region(location: str) -> str:
+    """
+    Returns "NA", "EMEA", or "UNKNOWN" based on detected location.
+    NA is the default for empty/unknown locations since most sources are NA-biased.
+    """
+    if not location:
+        return "NA"
+
+    # Check if it starts with Canada - (e.g. "Canada - Ontario")
+    if location.startswith("Canada") or location.startswith("Mexico"):
+        return "NA"
+
+    if location in NA_LOCATIONS:
+        return "NA"
+
+    if location in EMEA_LOCATIONS:
+        return "EMEA"
+
+    # Partial match for compound locations like "United States"
+    for na_loc in NA_LOCATIONS:
+        if na_loc.lower() in location.lower():
+            return "NA"
+
+    for emea_loc in EMEA_LOCATIONS:
+        if emea_loc.lower() in location.lower():
+            return "EMEA"
+
+    # Default to NA for anything unrecognised
+    return "NA"
+
+
+def split_by_region(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Split a combined list of rows into NA and EMEA based on detected location.
+    """
+    na_rows   = []
+    emea_rows = []
+
+    for row in rows:
+        location = row.get("Location", "") or ""
+        region   = classify_region(location)
+        if region == "EMEA":
+            emea_rows.append(row)
+        else:
+            na_rows.append(row)
+
+    return na_rows, emea_rows
+
 # --- Deduplication -----------------------------------------------------------
 
 def deduplicate(rows: list[dict]) -> list[dict]:
@@ -980,8 +1062,8 @@ def main():
     week = week_label()
     log.info("Running report for %s -> %s", start_date, end_date)
 
-    # ---- North America ----
-    na_rows = []
+    # ---- Collect all results into one pool ----
+    all_rows = []
 
     # 1. Google Search (NA queries)
     for query in SEARCH_QUERIES:
@@ -990,23 +1072,20 @@ def main():
         for item in items:
             row = parse_serpapi_result(item)
             if row:
-                na_rows.append(row)
+                all_rows.append(row)
         time.sleep(1)
 
     # 2. SAM.gov
     log.info("[NA] Searching SAM.gov ...")
-    na_rows.extend(samgov_search(start_date, end_date))
+    all_rows.extend(samgov_search(start_date, end_date))
 
     # 3. CanadaBuys
     log.info("[NA] Searching CanadaBuys ...")
-    na_rows.extend(canadabuys_search(start_date))
+    all_rows.extend(canadabuys_search(start_date))
 
     # 4. AusTender
     log.info("[NA] Searching AusTender ...")
-    na_rows.extend(austender_search(start_date, end_date))
-
-    # ---- EMEA ----
-    emea_rows = []
+    all_rows.extend(austender_search(start_date, end_date))
 
     # 5. Google Search (EMEA queries)
     for query in EMEA_SEARCH_QUERIES:
@@ -1015,38 +1094,38 @@ def main():
         for item in items:
             row = parse_serpapi_result(item)
             if row:
-                emea_rows.append(row)
+                all_rows.append(row)
         time.sleep(1)
 
     # 6. TED Europa
     log.info("[EMEA] Searching TED Europa ...")
-    emea_rows.extend(ted_europa_search(start_date, end_date))
+    all_rows.extend(ted_europa_search(start_date, end_date))
 
-    # ---- Process both ----
-    # 7. Deduplicate
-    na_rows   = deduplicate(na_rows)
-    emea_rows = deduplicate(emea_rows)
-    log.info("NA unique: %d | EMEA unique: %d", len(na_rows), len(emea_rows))
+    # 7. Deduplicate entire pool
+    all_rows = deduplicate(all_rows)
+    log.info("Total unique before enrichment: %d", len(all_rows))
 
-    # 8. Enrich with accurate dates and locations
-    log.info("Enriching NA articles ...")
-    na_rows = enrich_with_page_data(na_rows)
-    log.info("Enriching EMEA articles ...")
-    emea_rows = enrich_with_page_data(emea_rows)
+    # 8. Enrich all articles with accurate dates and locations
+    log.info("Fetching article pages for accurate dates and locations ...")
+    all_rows = enrich_with_page_data(all_rows)
 
-    # 9. Sort by date
+    # 9. Split into NA and EMEA based on detected location
+    na_rows, emea_rows = split_by_region(all_rows)
+    log.info("After location split — NA: %d | EMEA: %d", len(na_rows), len(emea_rows))
+
+    # 10. Sort by date
     na_rows.sort(key=lambda r: r.get("Date Published", ""), reverse=True)
     emea_rows.sort(key=lambda r: r.get("Date Published", ""), reverse=True)
 
     total = len(na_rows) + len(emea_rows)
     log.info("Total unique results: %d (NA: %d, EMEA: %d)", total, len(na_rows), len(emea_rows))
 
-    # 10. Build Excel with two tabs
+    # 11. Build Excel with two tabs
     wb       = build_workbook(na_rows, emea_rows, week)
     xlsx     = workbook_to_bytes(wb)
     filename = "Safespill_Hangar_Report_" + week + ".xlsx"
 
-    # 11. Send email
+    # 12. Send email
     send_email(xlsx, filename, start_date, end_date, total)
     log.info("Done.")
 
