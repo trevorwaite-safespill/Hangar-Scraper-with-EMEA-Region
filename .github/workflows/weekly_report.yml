@@ -1,34 +1,26 @@
 name: Safespill Weekly Hangar Report
 
 on:
-  # Every Monday at 8:00 AM PST = 16:00 UTC
   schedule:
-    - cron: "0 16 * * 1"
-
-  # Allow manual trigger from the GitHub Actions UI
-  workflow_dispatch:
+    - cron: '0 16 * * 1'   # Every Monday at 8am PST (16:00 UTC)
+  workflow_dispatch:         # Also allows manual trigger
 
 jobs:
   run-report:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run scraper and send report
         env:
-          SERPAPI_KEY:       ${{ secrets.SERPAPI_KEY }}
-          SAM_API_KEY:       ${{ secrets.SAM_API_KEY }}
-          SMTP_USER:         ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
-          REPORT_RECIPIENT:  trevorw@safespill.com
+          SERPAPI_KEY:        ${{ secrets.SERPAPI_KEY }}
+          SAM_API_KEY:        ${{ secrets.SAM_API_KEY }}
+          SMTP_USER:          ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:      ${{ secrets.SMTP_PASSWORD }}
+          REPORT_RECIPIENT:   ${{ secrets.REPORT_RECIPIENT }}
+          AUSTENDER_TOKEN:    ${{ secrets.AUSTENDER_TOKEN }}
         run: python scraper.py
