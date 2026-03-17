@@ -377,9 +377,9 @@ def enrich_with_page_data(rows: list[dict]) -> list[dict]:
             continue
         log.info("Fetching page %d/%d: %s", i + 1, len(rows), url)
         meta = fetch_article_meta(url)
-        if meta["publish_date"]:
+        if meta.get("publish_date"):
             row["Date Published"] = meta["publish_date"]
-        if meta["country"]:
+        if meta.get("country"):
             row["Location"] = meta["country"]
         time.sleep(0.5)   # be polite
     return rows
