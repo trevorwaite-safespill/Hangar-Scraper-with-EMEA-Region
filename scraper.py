@@ -1053,7 +1053,8 @@ def send_email(xlsx_bytes: bytes, filename: str, start_date: str, end_date: str,
         server.ehlo()
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, RECIPIENT, msg.as_string())
+        recipient_list = [r.strip() for r in RECIPIENT.split(",")]
+        server.sendmail(SMTP_USER, recipient_list, msg.as_string())
 
     log.info("Email sent to %s", RECIPIENT)
 
@@ -1139,4 +1140,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
