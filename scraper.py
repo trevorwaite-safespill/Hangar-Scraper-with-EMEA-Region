@@ -43,29 +43,57 @@ SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 RECIPIENT     = os.environ.get("REPORT_RECIPIENT", "trevorw@safespill.com")
 
 # --- Search configuration ----------------------------------------------------
-SEARCH_QUERIES = [
+#
+# Query strategy: all queries are run globally and articles get sorted into
+# the correct tab by detect_location() afterward. Queries are split into two
+# lists for readability — there is no "NA list / EMEA list" anymore since
+# the previous overlap was creating duplicate API calls for the same results.
+#
+# GENERAL_QUERIES: broad aviation / fire-protection terms that could surface
+#   articles from any region. These do the bulk of the discovery work.
+#
+# REGIONAL_QUERIES: include country or city names to specifically surface
+#   projects in EMEA / APAC markets that the general queries miss.
+
+GENERAL_QUERIES = [
     # New construction & development
-    "new aircraft hangar construction",
-    "hangar development project announced",
-    "airport hangar expansion planned",
+    "aircraft hangar construction",
+    "new aircraft hangar",
+    "hangar development project",
+    "airport hangar expansion",
     "hangar construction contract awarded",
-    "new FBO hangar development",
-    "aircraft hangar real estate development",
-    # Retrofit & upgrades
+    "hangar groundbreaking",
+    # FBO / private / corporate aviation
+    "FBO hangar development",
+    "FBO expansion",
+    "private aviation hangar",
+    "corporate hangar construction",
+    "business jet hangar",
+    # Retrofit & renovation
     "hangar retrofit project",
     "hangar renovation contract",
-    "hangar fire suppression upgrade",
+    # MRO & maintenance facilities
+    "MRO facility construction",
+    "aircraft maintenance hangar",
+    "MRO hangar project",
+    "wide-body maintenance hangar",
+    "narrow-body MRO",
+    "engine shop hangar",
+    "paint hangar construction",
+    "completions center aviation",
     # Military
-    "military hangar construction contract",
+    "military hangar construction",
     "Air Force hangar project",
     "Navy hangar construction",
-    # Commercial aviation
-    "airline maintenance hangar project",
-    "MRO facility construction",
-    "commercial aviation hangar development",
-    # Fire protection specific
+    "MILCON hangar contract",
+    # Fire protection — direct
     "hangar fire protection system",
-    "aircraft hangar fire suppression project",
+    "aircraft hangar fire suppression",
+    "hangar foam suppression",
+    # Fire protection — PFAS / AFFF transition (drives retrofit demand)
+    "AFFF hangar replacement",
+    "fluorine free foam hangar",
+    "NFPA 409 hangar",
 ]
 
 # Site filters removed — free SerpAPI tier works best with clean short queries
@@ -82,47 +110,30 @@ LOOKBACK_DAYS = 7
 # SAM.gov uses a longer lookback since contracts are posted infrequently
 SAM_LOOKBACK_DAYS = 30
 
-# --- EMEA Search configuration -----------------------------------------------
-EMEA_SEARCH_QUERIES = [
-    # New construction & development
-    "new aircraft hangar construction",
-    "hangar development project announced",
-    "airport hangar expansion planned",
-    "hangar construction contract awarded",
-    "new FBO hangar development",
-    "aircraft maintenance hangar project",
-    # MRO facilities
-    "MRO facility construction",
-    "MRO hangar project",
-    "aircraft maintenance facility construction",
-    "MRO centre expansion",
-    # Retrofit & upgrades
-    "hangar retrofit project",
-    "hangar renovation contract",
-    "hangar fire suppression upgrade",
-    "hangar fire protection upgrade",
-    # Fire protection specific
-    "hangar fire protection system",
-    "aircraft hangar fire suppression project",
-    "hangar foam suppression system",
-    # Military & government
-    "military hangar construction contract",
-    "air force hangar project",
-    "NATO hangar construction",
-    "defence hangar project",
-    # Region-specific with city/country names
+# --- Regional (location-specific) queries -----------------------------------
+# These include country or city names. They mostly target EMEA markets that
+# the general queries tend to under-surface.
+
+REGIONAL_QUERIES = [
+    # Middle East
     "hangar construction Dubai",
     "hangar project UAE",
+    "aircraft hangar Saudi Arabia",
+    "MRO facility Middle East",
+    "hangar Qatar",
+    # Africa
     "aircraft hangar Nigeria",
     "MRO facility Africa",
-    "hangar construction UK",
-    "aircraft maintenance hangar Germany",
-    "hangar project Saudi Arabia",
-    "MRO facility Middle East",
-    "hangar construction Poland",
-    "aircraft hangar Turkey",
     "MRO hangar Kenya",
     "aviation facility South Africa",
+    # Europe
+    "hangar construction UK",
+    "aircraft maintenance hangar Germany",
+    "hangar construction Poland",
+    "aircraft hangar Turkey",
+    # Defense (NATO / non-US military)
+    "NATO hangar construction",
+    "defence hangar project",
 ]
 
 # EMEA news domains extracted from known relevant sources
@@ -184,14 +195,17 @@ JSONLD_DATE_KEYS = ["datePublished", "dateCreated", "dateModified"]
 
 
 class MetaParser(HTMLParser):
-    """Extract <meta> tags and <script type=application/ld+json> from HTML."""
+    """Extract <meta> tags, <title>, and <script type=application/ld+json> from HTML."""
 
     def __init__(self):
         super().__init__()
-        self.meta   = {}   # property/name -> content
-        self.scripts = []  # raw text of ld+json blocks
+        self.meta    = {}   # property/name -> content
+        self.scripts = []   # raw text of ld+json blocks
+        self.title   = ""
         self._in_jsonld = False
+        self._in_title  = False
         self._buf       = []
+        self._title_buf = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -203,27 +217,36 @@ class MetaParser(HTMLParser):
         if tag == "script" and attrs.get("type") == "application/ld+json":
             self._in_jsonld = True
             self._buf = []
+        if tag == "title":
+            self._in_title  = True
+            self._title_buf = []
 
     def handle_endtag(self, tag):
         if tag == "script" and self._in_jsonld:
             self.scripts.append("".join(self._buf))
             self._in_jsonld = False
             self._buf = []
+        if tag == "title" and self._in_title:
+            if not self.title:  # only first <title>
+                self.title = "".join(self._title_buf).strip()
+            self._in_title  = False
+            self._title_buf = []
 
     def handle_data(self, data):
         if self._in_jsonld:
             self._buf.append(data)
+        if self._in_title:
+            self._title_buf.append(data)
 
 
 def fetch_article_meta(url: str) -> dict:
     """
     Fetch an article page and extract:
       - publish_date  (YYYY-MM-DD string or "")
-      - country       (str or "")
-      - state         (str or "")
-    Returns a dict with those three keys.
+      - location      (str or "")  -- detected country/region
+    Returns a dict with those keys.
     """
-    result = {"publish_date": "", "location": "", "state": ""}
+    result = {"publish_date": "", "location": ""}
     try:
         r = requests.get(url, headers=HEADERS_UA, timeout=15, allow_redirects=True)
         if r.status_code != 200:
@@ -235,7 +258,9 @@ def fetch_article_meta(url: str) -> dict:
 
     parser = MetaParser()
     try:
-        parser.parse(html)
+        # FIX: HTMLParser uses .feed(), not .parse(). The previous code silently
+        # failed and meta/JSON-LD data was never extracted.
+        parser.feed(html)
     except Exception:
         pass
 
@@ -276,10 +301,20 @@ def fetch_article_meta(url: str) -> dict:
     if date_str:
         result["publish_date"] = parse_iso_date(date_str)
 
-    # --- Extract location from full page text --------------------------------
-    # Use a larger chunk of visible text for better location detection
+    # --- Extract location ----------------------------------------------------
+    # Use only the title and the article opening (~3000 chars of visible text)
+    # rather than the entire page. This avoids footer/nav/sidebar pollution
+    # where unrelated locations from a site's other content cause misclassification.
+    title_text = parser.title or parser.meta.get("og:title", "") or ""
+    desc_text  = parser.meta.get("og:description", "") or parser.meta.get("description", "") or ""
+
     visible = re.sub(r'<[^>]+>', ' ', html)
-    result["country"] = detect_location(visible[:30_000])
+    # Collapse whitespace
+    visible = re.sub(r'\s+', ' ', visible)
+    # Limit body text to first 3000 chars (article opening)
+    body_snippet = (desc_text + " " + visible[:3000]).strip()
+
+    result["location"] = detect_location(body_snippet, title=title_text)
 
     return result
 
@@ -299,22 +334,106 @@ def parse_iso_date(raw: str) -> str:
     return ""
 
 
+# --- SerpAPI quota tracking --------------------------------------------------
+
+SERPAPI_ACCOUNT_URL = "https://serpapi.com/account.json"
+
+
+def check_serpapi_quota() -> dict:
+    """
+    Query SerpAPI's free /account.json endpoint to check quota usage.
+    This call is FREE — it does not count against your monthly search budget.
+    Returns a dict with quota info, or an empty dict if the call fails.
+    """
+    try:
+        r = requests.get(
+            SERPAPI_ACCOUNT_URL,
+            params={"api_key": SERPAPI_KEY},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        log.warning("Could not check SerpAPI quota: %s", exc)
+        return {}
+
+
+def log_quota_status(label: str, quota: dict):
+    """Pretty-print SerpAPI quota info to the log."""
+    if not quota:
+        log.info("[%s] SerpAPI quota: <unable to fetch>", label)
+        return
+    plan       = quota.get("plan_name", "unknown")
+    left       = quota.get("total_searches_left", "?")
+    monthly    = quota.get("searches_per_month", "?")
+    used       = quota.get("this_month_usage", "?")
+    hourly     = quota.get("last_hour_searches", "?")
+    hourly_cap = quota.get("account_rate_limit_per_hour", "?")
+    log.info(
+        "[%s] SerpAPI quota — plan=%s | %s/%s used this month | "
+        "%s left | %s/%s used last hour",
+        label, plan, used, monthly, left, hourly, hourly_cap,
+    )
+
+
 # --- SerpAPI -----------------------------------------------------------------
 
+# Counts SerpAPI rate-limit / quota errors during a run. Reset at start of
+# main(). Used to add a warning notice to the team email if errors occurred.
+_SERPAPI_ERROR_COUNT = 0
+
+
 def serpapi_news_search(query: str) -> list[dict]:
+    global _SERPAPI_ERROR_COUNT
     url = "https://serpapi.com/search"
     params = {
         "engine":  "google",
         "q":       query,
         "gl":      "us",
         "hl":      "en",
-        "num":     10,
+        # SerpAPI bills per search, NOT per result. Bumping num from 10 → 100
+        # gets up to 10x more results at zero additional API cost.
+        "num":     100,
         "api_key": SERPAPI_KEY,
     }
     try:
         r = requests.get(url, params=params, timeout=20)
+
+        # Detect rate-limit / quota errors explicitly so they show up clearly
+        # in logs instead of looking like an empty-result query.
+
+        # Hourly throughput cap exceeded (HTTP 429)
+        if r.status_code == 429:
+            _SERPAPI_ERROR_COUNT += 1
+            log.error(
+                "SerpAPI RATE LIMITED for '%s' (HTTP 429). "
+                "Hourly throughput cap reached (free tier = 50/hour). "
+                "Either you re-triggered a run too soon after the previous one, "
+                "or you're at the monthly cap. Check https://serpapi.com/dashboard.",
+                query,
+            )
+            return []
+
         r.raise_for_status()
-        data    = r.json()
+        data = r.json()
+
+        # SerpAPI sometimes returns HTTP 200 with an 'error' field for
+        # quota / auth / parameter problems. Surface these explicitly.
+        if "error" in data:
+            err_msg   = data.get("error", "")
+            err_lower = err_msg.lower()
+            if any(term in err_lower for term in ("run out", "exceeded", "limit", "quota")):
+                _SERPAPI_ERROR_COUNT += 1
+                log.error(
+                    "SerpAPI QUOTA ERROR for '%s': %s. "
+                    "Likely exhausted your monthly free searches (250/month). "
+                    "Reduce query count or upgrade plan.",
+                    query, err_msg,
+                )
+            else:
+                log.warning("SerpAPI returned error for '%s': %s", query, err_msg)
+            return []
+
         results = data.get("organic_results", [])
         log.info("SerpAPI '%s' -> %d results", query, len(results))
         return results
@@ -332,9 +451,10 @@ def parse_serpapi_result(item: dict) -> dict | None:
         return None
 
     # Fallback date/location from snippet (will be overwritten by page fetch)
-    date_raw         = item.get("date", "")
-    fallback_date    = parse_google_date(date_raw)
-    location = detect_location(snippet + " " + title)
+    date_raw      = item.get("date", "")
+    fallback_date = parse_google_date(date_raw)
+    # Pass title separately so detect_location can weight headline mentions higher
+    location      = detect_location(snippet, title=title)
 
     return {
         "Project Title":  title,
@@ -371,7 +491,7 @@ def parse_google_date(raw: str) -> str:
 
 def enrich_with_page_data(rows: list[dict]) -> list[dict]:
     """
-    Visit each article URL and overwrite date/country/state with
+    Visit each article URL and overwrite date/location with
     accurate values extracted directly from the page.
     """
     for i, row in enumerate(rows):
@@ -382,8 +502,8 @@ def enrich_with_page_data(rows: list[dict]) -> list[dict]:
         meta = fetch_article_meta(url)
         if meta.get("publish_date"):
             row["Date Published"] = meta["publish_date"]
-        if meta.get("country"):
-            row["Location"] = meta["country"]
+        if meta.get("location"):
+            row["Location"] = meta["location"]
         time.sleep(0.5)   # be polite
     return rows
 
@@ -452,10 +572,17 @@ def parse_sam_result(opp: dict) -> dict | None:
         return None
 
     place        = opp.get("placeOfPerformance", {}) or {}
-    state_code   = (place.get("state", {}) or {}).get("name", "")
+    state_name   = (place.get("state", {}) or {}).get("name", "")
     country_name = (place.get("country", {}) or {}).get("name", "United States")
     if country_name not in NA_COUNTRIES:
         country_name = "United States"
+
+    # FIX: 'location' was undefined in the previous version, causing a
+    # NameError that silently dropped every SAM.gov result.
+    if state_name:
+        location = country_name + " - " + state_name
+    else:
+        location = country_name
 
     posted = opp.get("postedDate", "")[:10] if opp.get("postedDate") else ""
     url    = "https://sam.gov/opp/" + opp.get("noticeId", "") + "/view"
@@ -465,7 +592,6 @@ def parse_sam_result(opp: dict) -> dict | None:
         "Source URL":     url,
         "Summary":        desc.strip()[:300] if desc else "",
         "Date Published": posted,
-        "Region":         "NA",
         "Location":       location,
         "Source":         "sam_gov",
     }
@@ -643,7 +769,7 @@ def ted_europa_search(start_date: str, end_date: str) -> list[dict]:
         try:
             payload = {
                 "query":  keyword,
-                "fields": ["title", "summary", "publicationDate", "noticePublicationId", "noticeType"],
+                "fields": ["title", "summary", "publicationDate", "noticePublicationId", "noticeType", "buyer-country"],
                 "page":   1,
                 "limit":  25,
                 "filters": {
@@ -676,12 +802,17 @@ def ted_europa_search(start_date: str, end_date: str) -> list[dict]:
                 if not title:
                     continue
 
+                # Try to detect a more specific country than just "Europe"
+                # by scanning title + summary
+                detected = detect_location(summary, title=title)
+                location = detected if detected else "Europe"
+
                 results.append({
                     "Project Title":  title.strip(),
                     "Source URL":     url,
                     "Summary":        summary.strip()[:300] if summary else "",
                     "Date Published": pub_date,
-                    "Location":        "Europe",
+                    "Location":       location,
                     "Source":         "ted_europa",
                 })
 
@@ -694,8 +825,14 @@ def ted_europa_search(start_date: str, end_date: str) -> list[dict]:
 
 
 # --- Location detection ------------------------------------------------------
+#
+# Strategy: score every candidate country based on mentions in the title
+# (weighted heavily) and body (weighted lightly). Use word-boundary regex
+# to avoid false matches like "India" inside "Indianapolis". Pick the country
+# with the highest total score. Country names are stronger signals than city
+# names, since cities often appear in unrelated contexts.
 
-US_STATES = {
+US_STATES_FULL = {
     "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut",
     "Delaware","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa",
     "Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan",
@@ -704,18 +841,23 @@ US_STATES = {
     "North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island",
     "South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
     "Virginia","Washington","West Virginia","Wisconsin","Wyoming",
+}
+
+# Two-letter state codes — only matched with strict word boundaries because they
+# are short and risk colliding with common words. We keep them but require at
+# least one full state name OR a US-specific keyword to confirm "US".
+US_STATE_ABBR = {
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
     "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
     "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
     "TX","UT","VT","VA","WA","WV","WI","WY",
 }
 
-CA_PROVINCES = {
+CA_PROVINCES_FULL = {
     "Alberta","British Columbia","Manitoba","New Brunswick",
     "Newfoundland and Labrador","Nova Scotia","Ontario",
     "Prince Edward Island","Quebec","Saskatchewan",
     "Northwest Territories","Nunavut","Yukon",
-    "AB","BC","MB","NB","NL","NS","ON","PE","QC","SK","NT","NU","YT",
 }
 
 MX_STATES = {
@@ -727,8 +869,10 @@ MX_STATES = {
     "Veracruz","Yucatan","Zacatecas",
 }
 
-# European countries
-EUROPE_COUNTRIES = [
+# --- Country -> region mapping (canonical) ----------------------------------
+# Each country is in EXACTLY one region. No duplicates.
+
+EUROPE_COUNTRIES = {
     "Albania","Andorra","Armenia","Austria","Azerbaijan","Belarus","Belgium",
     "Bosnia and Herzegovina","Bulgaria","Croatia","Cyprus","Czech Republic",
     "Czechia","Denmark","Estonia","Finland","France","Georgia","Germany",
@@ -738,171 +882,298 @@ EUROPE_COUNTRIES = [
     "Portugal","Romania","Russia","San Marino","Serbia","Slovakia","Slovenia",
     "Spain","Sweden","Switzerland","Turkey","Ukraine","United Kingdom",
     "Vatican","England","Scotland","Wales","Northern Ireland",
-    # Major European cities that commonly appear in articles
-    "London","Paris","Berlin","Madrid","Rome","Amsterdam","Brussels",
-    "Vienna","Warsaw","Prague","Budapest","Bucharest","Stockholm","Oslo",
-    "Copenhagen","Helsinki","Athens","Lisbon","Dublin","Zurich","Geneva",
-    "Munich","Frankfurt","Hamburg","Barcelona","Milan","Naples","Turin",
-    "Schiphol","Heathrow","Gatwick","Stansted","Luton","Birmingham",
-    "Tewkesbury","Gloucester","Powidz","Larnaca","Nicosia",
-]
+}
 
-# Middle Eastern countries and cities
-MIDDLE_EAST_COUNTRIES = [
-    "Bahrain","Cyprus","Egypt","Iran","Iraq","Israel","Jordan","Kuwait",
+MIDDLE_EAST_COUNTRIES = {
+    "Bahrain","Iran","Iraq","Israel","Jordan","Kuwait",
     "Lebanon","Oman","Palestine","Qatar","Saudi Arabia","Syria",
-    "United Arab Emirates","UAE","Yemen",
-    # Major cities
-    "Dubai","Abu Dhabi","Doha","Riyadh","Jeddah","Muscat","Manama",
-    "Amman","Beirut","Tel Aviv","Cairo","Kuwait City","Dubai South",
-    "Mohammed bin Rashid","Sharjah","Ras Al Khaimah",
-]
+    "United Arab Emirates","Yemen",
+}
 
-# African countries and cities
-AFRICA_COUNTRIES = [
+AFRICA_COUNTRIES = {
     "Algeria","Angola","Benin","Botswana","Burkina Faso","Burundi",
     "Cameroon","Cape Verde","Central African Republic","Chad","Comoros",
     "Congo","Ivory Coast","Djibouti","Egypt","Equatorial Guinea","Eritrea",
     "Eswatini","Ethiopia","Gabon","Gambia","Ghana","Guinea","Guinea-Bissau",
     "Kenya","Lesotho","Liberia","Libya","Madagascar","Malawi","Mali",
     "Mauritania","Mauritius","Morocco","Mozambique","Namibia","Niger",
-    "Nigeria","Rwanda","Sao Tome","Senegal","Seychelles","Sierra Leone",
+    "Nigeria","Rwanda","Senegal","Seychelles","Sierra Leone",
     "Somalia","South Africa","South Sudan","Sudan","Tanzania","Togo",
     "Tunisia","Uganda","Zambia","Zimbabwe",
-    # Major cities
-    "Lagos","Abuja","Nairobi","Johannesburg","Cape Town","Accra","Addis Ababa",
-    "Dar es Salaam","Casablanca","Tunis","Algiers","Kampala","Dakar",
-    "Anambra","Enugu","Kano","Port Harcourt",
-]
+}
 
-# Asian countries relevant to aviation (for Asia-Pacific results)
-ASIA_COUNTRIES = [
+# Asia-Pacific — folded into the EMEA tab since the report has only 2 tabs
+# and there is no separate APAC tab. Trevor: change this if you want APAC
+# to land somewhere else (or to be excluded entirely).
+APAC_COUNTRIES = {
     "Afghanistan","Bangladesh","Bhutan","Brunei","Cambodia","China",
     "India","Indonesia","Japan","Laos","Malaysia","Maldives","Mongolia",
     "Myanmar","Nepal","North Korea","Pakistan","Philippines","Singapore",
     "South Korea","Sri Lanka","Taiwan","Thailand","Timor-Leste","Vietnam",
     "Australia","New Zealand","Papua New Guinea","Fiji",
-    # Major cities
-    "Beijing","Shanghai","Tokyo","Seoul","Singapore City","Mumbai","Delhi",
-    "Bangkok","Jakarta","Kuala Lumpur","Manila","Karachi","Dhaka",
-    "Hong Kong","Taipei","Colombo","Kathmandu","Yangon","Phnom Penh",
-    "Ho Chi Minh","Hanoi","Kochi","Kerala","Larnaca",
-]
-
-def detect_location(text: str) -> str:
-    """
-    Detect the most specific location mentioned in the text.
-    Returns a location string (country, city, or region).
-    Checks EMEA regions before defaulting to North America.
-    """
-    lower = text.lower()
-
-    # Check Middle East first (before Africa/Europe to catch UAE, Dubai etc.)
-    for place in sorted(MIDDLE_EAST_COUNTRIES, key=len, reverse=True):
-        if place.lower() in lower:
-            return place
-
-    # Check Africa
-    for place in sorted(AFRICA_COUNTRIES, key=len, reverse=True):
-        if place.lower() in lower:
-            return place
-
-    # Check Europe
-    for place in sorted(EUROPE_COUNTRIES, key=len, reverse=True):
-        if place.lower() in lower:
-            return place
-
-    # Check Asia-Pacific
-    for place in sorted(ASIA_COUNTRIES, key=len, reverse=True):
-        if place.lower() in lower:
-            return place
-
-    # Check Canada
-    CA_PROVINCES_LIST = sorted(CA_PROVINCES, key=len, reverse=True)
-    if "canada" in lower:
-        for prov in CA_PROVINCES_LIST:
-            if prov.lower() in lower:
-                return "Canada - " + prov
-        return "Canada"
-
-    # Check Mexico
-    MX_STATES_LIST = sorted(MX_STATES, key=len, reverse=True)
-    if "mexico" in lower:
-        for st in MX_STATES_LIST:
-            if st.lower() in lower:
-                return "Mexico - " + st
-        return "Mexico"
-
-    # Check US states
-    for st in sorted(US_STATES, key=len, reverse=True):
-        if st.lower() in lower:
-            return "United States"
-
-    return ""
-
-
-
-
-# --- Location classification -------------------------------------------------
-
-NA_LOCATIONS = {
-    "United States", "Canada", "Mexico",
-    # US states
-    "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut",
-    "Delaware","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa",
-    "Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan",
-    "Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada",
-    "New Hampshire","New Jersey","New Mexico","New York","North Carolina",
-    "North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island",
-    "South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
-    "Virginia","Washington","West Virginia","Wisconsin","Wyoming",
-    # Canadian provinces
-    "Alberta","British Columbia","Manitoba","New Brunswick",
-    "Newfoundland and Labrador","Nova Scotia","Ontario",
-    "Prince Edward Island","Quebec","Saskatchewan",
-    "Northwest Territories","Nunavut","Yukon",
-    # Mexican states
-    "Aguascalientes","Baja California","Baja California Sur","Campeche",
-    "Chiapas","Chihuahua","Coahuila","Colima","Durango","Guanajuato",
-    "Guerrero","Hidalgo","Jalisco","Mexico City","Michoacan","Morelos",
-    "Nayarit","Nuevo Leon","Oaxaca","Puebla","Queretaro","Quintana Roo",
-    "San Luis Potosi","Sinaloa","Sonora","Tabasco","Tamaulipas","Tlaxcala",
-    "Veracruz","Yucatan","Zacatecas",
 }
 
-# Locations that are clearly EMEA — used to catch misclassified NA articles
-EMEA_LOCATIONS = set(
-    EUROPE_COUNTRIES + MIDDLE_EAST_COUNTRIES + AFRICA_COUNTRIES
+# Country aliases / abbreviations — these resolve to canonical country names.
+# Keys MUST be unique. Only include unambiguous aliases.
+COUNTRY_ALIASES = {
+    "USA":               "United States",
+    "U.S.":              "United States",
+    "U.S.A.":            "United States",
+    "America":           "United States",  # weak but common
+    "UK":                "United Kingdom",
+    "U.K.":              "United Kingdom",
+    "Britain":           "United Kingdom",
+    "Great Britain":     "United Kingdom",
+    "UAE":               "United Arab Emirates",
+    "U.A.E.":            "United Arab Emirates",
+    "Holland":           "Netherlands",
+    "Czech":             "Czechia",
+    "South Korean":      "South Korea",
+    "North Korean":      "North Korea",
+}
+
+# Major cities that map UNAMBIGUOUSLY to a country. Cities that exist in
+# multiple countries (London, Birmingham, Paris, Manchester, etc.) are NOT
+# included here — relying on the country name to appear elsewhere in the text
+# is safer than guessing.
+COUNTRY_CITIES = {
+    # Middle East — strong, distinctive city signals
+    "United Arab Emirates": ["Dubai", "Abu Dhabi", "Sharjah", "Ras Al Khaimah",
+                              "Ajman", "Fujairah", "Umm Al Quwain"],
+    "Saudi Arabia":         ["Riyadh", "Jeddah", "Dammam", "Mecca", "Medina",
+                              "Tabuk", "NEOM"],
+    "Qatar":                ["Doha"],
+    "Bahrain":              ["Manama"],
+    "Kuwait":               ["Kuwait City"],
+    "Oman":                 ["Muscat"],
+    "Jordan":               ["Amman"],
+    "Israel":               ["Tel Aviv", "Jerusalem", "Haifa"],
+    "Lebanon":              ["Beirut"],
+
+    # Africa — distinctive city signals
+    "Egypt":                ["Cairo", "Alexandria", "Giza"],
+    "Nigeria":              ["Lagos", "Abuja", "Port Harcourt", "Ibadan", "Kano"],
+    "Kenya":                ["Nairobi", "Mombasa"],
+    "South Africa":         ["Johannesburg", "Cape Town", "Pretoria", "Durban"],
+    "Morocco":              ["Casablanca", "Rabat", "Marrakech", "Tangier"],
+    "Tunisia":              ["Tunis"],
+    "Algeria":              ["Algiers"],
+    "Ethiopia":             ["Addis Ababa"],
+    "Tanzania":             ["Dar es Salaam"],
+    "Uganda":               ["Kampala"],
+    "Senegal":              ["Dakar"],
+    "Ghana":                ["Accra"],
+
+    # Europe — distinctive city signals (skipping ones that collide with US/CA)
+    "France":               ["Toulouse", "Marseille", "Lyon", "Nice"],
+    "Germany":               ["Berlin", "Munich", "Frankfurt", "Hamburg",
+                              "Cologne", "Stuttgart", "Düsseldorf"],
+    "Spain":                ["Madrid", "Barcelona", "Valencia", "Seville"],
+    "Italy":                ["Rome", "Milan", "Naples", "Turin", "Florence", "Venice"],
+    "Netherlands":          ["Amsterdam", "Rotterdam", "Schiphol", "Eindhoven"],
+    "Belgium":              ["Brussels", "Antwerp"],
+    "Austria":              ["Vienna", "Salzburg"],
+    "Poland":               ["Warsaw", "Krakow", "Wroclaw", "Gdansk", "Powidz"],
+    "Czechia":              ["Prague", "Brno"],
+    "Hungary":              ["Budapest"],
+    "Romania":              ["Bucharest"],
+    "Greece":               ["Athens", "Thessaloniki"],
+    "Portugal":             ["Lisbon", "Porto"],
+    "Sweden":               ["Stockholm", "Gothenburg"],
+    "Norway":               ["Oslo", "Bergen"],
+    "Denmark":              ["Copenhagen"],
+    "Finland":              ["Helsinki"],
+    "Switzerland":          ["Zurich", "Geneva", "Basel"],
+    "Ireland":              ["Dublin"],
+    "Cyprus":               ["Nicosia", "Larnaca", "Limassol"],
+    "Turkey":               ["Istanbul", "Ankara", "Izmir"],
+    "Ukraine":              ["Kyiv", "Kiev", "Lviv"],
+
+    # APAC
+    "Australia":            ["Sydney", "Melbourne", "Brisbane", "Perth",
+                              "Adelaide", "Canberra"],
+    "Japan":                ["Tokyo", "Osaka", "Yokohama", "Nagoya"],
+    "Singapore":            ["Changi"],
+    "China":                ["Beijing", "Shanghai", "Shenzhen", "Guangzhou"],
+    "India":                ["Mumbai", "Bengaluru", "Hyderabad", "Chennai"],
+    "Thailand":             ["Bangkok"],
+    "Malaysia":             ["Kuala Lumpur"],
+    "Indonesia":            ["Jakarta"],
+    "Philippines":          ["Manila"],
+    "South Korea":          ["Seoul", "Busan", "Incheon"],
+    "Vietnam":              ["Hanoi", "Ho Chi Minh"],
+    "Taiwan":               ["Taipei"],
+}
+
+# Build a master country -> region lookup
+COUNTRY_REGION = {}
+for c in EUROPE_COUNTRIES:        COUNTRY_REGION[c] = "EMEA"
+for c in MIDDLE_EAST_COUNTRIES:   COUNTRY_REGION[c] = "EMEA"
+for c in AFRICA_COUNTRIES:        COUNTRY_REGION[c] = "EMEA"
+for c in APAC_COUNTRIES:          COUNTRY_REGION[c] = "EMEA"   # see comment above
+COUNTRY_REGION["United States"] = "NA"
+COUNTRY_REGION["Canada"]         = "NA"
+COUNTRY_REGION["Mexico"]         = "NA"
+
+# All canonical country names we'll search for directly
+ALL_COUNTRIES = (
+    EUROPE_COUNTRIES | MIDDLE_EAST_COUNTRIES | AFRICA_COUNTRIES |
+    APAC_COUNTRIES | {"United States", "Canada", "Mexico"}
 )
+
+
+def _word_count(needle: str, haystack_lower: str) -> int:
+    """Count whole-word occurrences of needle (case-insensitive)."""
+    if not needle:
+        return 0
+    pattern = r'\b' + re.escape(needle.lower()) + r'\b'
+    return len(re.findall(pattern, haystack_lower))
+
+
+def detect_location(text: str, title: str = "") -> str:
+    """
+    Detect the most likely location for an article.
+
+    Returns a location string like "United States - Texas", "United Kingdom",
+    "Canada - Ontario", "United Arab Emirates", or "" if nothing detected.
+
+    Algorithm: score every candidate country based on weighted mentions in
+    title and body, with title hits weighted ~5x heavier. Country-name hits
+    are stronger than city-name hits. Returns the highest-scoring country.
+    """
+    if not text and not title:
+        return ""
+
+    title_lower = (title or "").lower()
+    body_lower  = (text  or "").lower()
+
+    scores = {}  # canonical country -> float score
+
+    def add_score(country: str, points: float):
+        if points <= 0:
+            return
+        scores[country] = scores.get(country, 0.0) + points
+
+    TITLE_WEIGHT       = 5.0
+    BODY_WEIGHT        = 1.0
+    CITY_TITLE_WEIGHT  = 4.0
+    CITY_BODY_WEIGHT   = 0.7
+    ALIAS_TITLE_WEIGHT = 4.0
+    ALIAS_BODY_WEIGHT  = 0.8
+
+    # 1. Direct country name matches
+    for country in ALL_COUNTRIES:
+        t = _word_count(country, title_lower)
+        b = _word_count(country, body_lower)
+        add_score(country, t * TITLE_WEIGHT + b * BODY_WEIGHT)
+
+    # 2. Country aliases (USA, UK, UAE, Britain, etc.)
+    for alias, canonical in COUNTRY_ALIASES.items():
+        t = _word_count(alias, title_lower)
+        b = _word_count(alias, body_lower)
+        add_score(canonical, t * ALIAS_TITLE_WEIGHT + b * ALIAS_BODY_WEIGHT)
+
+    # 3. City name matches (lower weight than country names)
+    for country, cities in COUNTRY_CITIES.items():
+        for city in cities:
+            t = _word_count(city, title_lower)
+            b = _word_count(city, body_lower)
+            add_score(country, t * CITY_TITLE_WEIGHT + b * CITY_BODY_WEIGHT)
+
+    # 4. UK constituent countries map to "United Kingdom" for region purposes
+    for uk_part in ("England", "Scotland", "Wales", "Northern Ireland"):
+        t = _word_count(uk_part, title_lower)
+        b = _word_count(uk_part, body_lower)
+        if t or b:
+            add_score("United Kingdom", t * TITLE_WEIGHT + b * BODY_WEIGHT)
+
+    # 5. US state matching → contributes to "United States" with state name
+    us_state_score = 0.0
+    detected_state = None
+    detected_state_score = 0.0
+    for st in US_STATES_FULL:
+        t = _word_count(st, title_lower)
+        b = _word_count(st, body_lower)
+        s = t * TITLE_WEIGHT + b * BODY_WEIGHT
+        if s > 0:
+            us_state_score += s
+            # Track the highest-scoring state for the output
+            if s > detected_state_score:
+                detected_state_score = s
+                detected_state = st
+    if us_state_score > 0:
+        add_score("United States", us_state_score)
+
+    # 6. Canadian province matching → contributes to "Canada"
+    ca_score = 0.0
+    detected_province = None
+    detected_province_score = 0.0
+    for prov in CA_PROVINCES_FULL:
+        t = _word_count(prov, title_lower)
+        b = _word_count(prov, body_lower)
+        s = t * TITLE_WEIGHT + b * BODY_WEIGHT
+        if s > 0:
+            ca_score += s
+            if s > detected_province_score:
+                detected_province_score = s
+                detected_province = prov
+    if ca_score > 0:
+        add_score("Canada", ca_score)
+
+    # 7. Mexican state matching → contributes to "Mexico"
+    mx_score = 0.0
+    for st in MX_STATES:
+        t = _word_count(st, title_lower)
+        b = _word_count(st, body_lower)
+        mx_score += t * TITLE_WEIGHT + b * BODY_WEIGHT
+    if mx_score > 0:
+        add_score("Mexico", mx_score)
+
+    # No signals at all
+    if not scores:
+        return ""
+
+    # Pick the winner
+    best_country = max(scores, key=scores.get)
+
+    # Format output with state/province if applicable
+    if best_country == "United States" and detected_state:
+        return "United States - " + detected_state
+    if best_country == "Canada" and detected_province:
+        return "Canada - " + detected_province
+    return best_country
+
+
+# --- Region classification ---------------------------------------------------
 
 def classify_region(location: str) -> str:
     """
-    Returns "NA", "EMEA", or "UNKNOWN" based on detected location.
-    NA is the default for empty/unknown locations since most sources are NA-biased.
+    Returns "NA" or "EMEA" for tab assignment.
+
+    Empty/unknown locations default to NA (since most NA-source feeds —
+    SAM.gov, CanadaBuys, US-biased Google search — produce them).
     """
     if not location:
         return "NA"
 
-    # Check if it starts with Canada - (e.g. "Canada - Ontario")
-    if location.startswith("Canada") or location.startswith("Mexico"):
-        return "NA"
+    # Strip "Country - State/Province" formatting to get just the country
+    base = location.split(" - ", 1)[0].strip()
 
-    if location in NA_LOCATIONS:
-        return "NA"
+    # Direct lookup in the region map
+    region = COUNTRY_REGION.get(base)
+    if region:
+        return region
 
-    if location in EMEA_LOCATIONS:
+    # Fallback partial-match lookup (handles edge cases like "Europe", "EMEA")
+    base_lower = base.lower()
+    if base_lower in ("europe", "european union", "eu", "emea", "middle east",
+                      "africa", "asia", "asia pacific", "apac"):
         return "EMEA"
+    if base_lower in ("north america", "americas"):
+        return "NA"
 
-    # Partial match for compound locations like "United States"
-    for na_loc in NA_LOCATIONS:
-        if na_loc.lower() in location.lower():
-            return "NA"
-
-    for emea_loc in EMEA_LOCATIONS:
-        if emea_loc.lower() in location.lower():
-            return "EMEA"
-
-    # Default to NA for anything unrecognised
+    # Unknown — default to NA so we don't dump random international stuff
+    # into EMEA either; better to err on the side that maintainers will notice
     return "NA"
 
 
@@ -947,7 +1218,7 @@ HEADERS = [
 
 COL_WIDTHS = {
     "Project Title":  40, "Source URL": 50, "Summary": 60,
-    "Date Published": 15, "Location": 20,
+    "Date Published": 15, "Location": 25,
 }
 
 HEADER_FILL  = PatternFill("solid", fgColor="1F3864")
@@ -1017,7 +1288,7 @@ def workbook_to_bytes(wb: openpyxl.Workbook) -> bytes:
 
 EMAIL_BODY = """\
 Hi Safespill Team,
-
+{notice_block}
 Please find attached this week's Safespill Hangar Intelligence Report.
 
 The report covers new hangar projects, retrofit work, construction contracts,
@@ -1025,8 +1296,8 @@ and fire protection opportunities globally, discovered between
 {start_date} and {end_date}.
 
 The Excel file contains two tabs:
-  - North America: Google Search, SAM.gov, CanadaBuys, AusTender
-  - EMEA: Google Search, TED Europa
+  - North America: Google Search, SAM.gov, CanadaBuys
+  - EMEA: Google Search, TED Europa, AusTender (Australia/APAC folded into EMEA)
 
 Total results this week: {count}
 
@@ -1034,13 +1305,68 @@ Safespill Automated Intelligence Report
 """
 
 
-def send_email(xlsx_bytes: bytes, filename: str, start_date: str, end_date: str, count: int):
+def build_quota_notice(ending_quota: dict, error_count: int) -> str:
+    """
+    Build the optional notice paragraph that appears in the email body when
+    SerpAPI quota is low or rate-limit errors occurred during the run.
+    Returns an empty string in normal weeks (no notice is shown).
+    """
+    # Rate-limit / quota errors occurred during this run — most severe case
+    if error_count > 0:
+        return (
+            "WARNING: Coverage may have been incomplete this week. The scraper "
+            "encountered SerpAPI rate or quota limits {n} time(s) during this "
+            "run, meaning some search queries returned no results. Upgrading "
+            "from the free SerpAPI plan ($25/month for 4x capacity) would "
+            "resolve this."
+        ).format(n=error_count)
+
+    if not ending_quota:
+        return ""
+
+    try:
+        left    = int(ending_quota.get("total_searches_left", 0))
+        monthly = int(ending_quota.get("searches_per_month", 0))
+        if monthly <= 0:
+            return ""
+        pct_left = 100.0 * left / monthly
+    except (ValueError, TypeError):
+        return ""
+
+    if pct_left < 10:
+        return (
+            "WARNING: SerpAPI quota is critically low ({left} of {monthly} "
+            "searches remaining for the month). Next week's report may be "
+            "incomplete unless the API plan is upgraded."
+        ).format(left=left, monthly=monthly)
+
+    if pct_left < 25:
+        pct_used = 100 - pct_left
+        return (
+            "Note: SerpAPI usage is at {pct:.0f}% for the month ({left} "
+            "searches remaining). Coverage may be reduced in the final run "
+            "of this billing cycle."
+        ).format(pct=pct_used, left=left)
+
+    # Normal week — no notice
+    return ""
+
+
+def send_email(xlsx_bytes: bytes, filename: str, start_date: str, end_date: str,
+               count: int, quota_notice: str = ""):
     msg            = MIMEMultipart()
     msg["From"]    = SMTP_USER
     msg["To"]      = RECIPIENT
     msg["Subject"] = "Safespill Hangar Intelligence Report - Week of " + week_label()
 
+    # The notice block is a blank line in normal weeks, or a notice paragraph
+    # surrounded by blank lines when there's something worth flagging.
+    notice_block = ""
+    if quota_notice:
+        notice_block = "\n" + quota_notice + "\n"
+
     msg.attach(MIMEText(EMAIL_BODY.format(
+        notice_block=notice_block,
         start_date=start_date, end_date=end_date, count=count), "plain"))
 
     part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1062,16 +1388,23 @@ def send_email(xlsx_bytes: bytes, filename: str, start_date: str, end_date: str,
 # --- Main --------------------------------------------------------------------
 
 def main():
+    global _SERPAPI_ERROR_COUNT
+    _SERPAPI_ERROR_COUNT = 0
+
     start_date, end_date = date_range()
     week = week_label()
     log.info("Running report for %s -> %s", start_date, end_date)
 
+    # Check starting SerpAPI quota (free call — does NOT count against budget)
+    starting_quota = check_serpapi_quota()
+    log_quota_status("Start", starting_quota)
+
     # ---- Collect all results into one pool ----
     all_rows = []
 
-    # 1. Google Search (NA queries)
-    for query in SEARCH_QUERIES:
-        log.info("[NA] Searching Google: '%s'", query)
+    # 1. Google Search — general queries (region auto-detected from results)
+    for query in GENERAL_QUERIES:
+        log.info("[Search] '%s'", query)
         items = serpapi_news_search(query)
         for item in items:
             row = parse_serpapi_result(item)
@@ -1091,13 +1424,13 @@ def main():
     log.info("[NA] Searching CanadaBuys ...")
     all_rows.extend(canadabuys_search(start_date))
 
-    # 4. AusTender
-    log.info("[NA] Searching AusTender ...")
+    # 4. AusTender (Australia — folded into EMEA tab)
+    log.info("[APAC] Searching AusTender ...")
     all_rows.extend(austender_search(start_date, end_date))
 
-    # 5. Google Search (EMEA queries)
-    for query in EMEA_SEARCH_QUERIES:
-        log.info("[EMEA] Searching Google: '%s'", query)
+    # 5. Google Search — region-targeted queries (with country/city names)
+    for query in REGIONAL_QUERIES:
+        log.info("[Regional Search] '%s'", query)
         items = serpapi_news_search(query)
         for item in items:
             row = parse_serpapi_result(item)
@@ -1133,10 +1466,50 @@ def main():
     xlsx     = workbook_to_bytes(wb)
     filename = "Safespill_Hangar_Report_" + week + ".xlsx"
 
-    # 12. Send email
-    send_email(xlsx, filename, start_date, end_date, total)
+    # Check ending SerpAPI quota BEFORE sending email so we can include
+    # warnings in the email body if quota is low or errors occurred.
+    ending_quota = check_serpapi_quota()
+    log_quota_status("End", ending_quota)
+
+    quota_notice = build_quota_notice(ending_quota, _SERPAPI_ERROR_COUNT)
+
+    # 12. Send email (with optional quota warning notice)
+    send_email(xlsx, filename, start_date, end_date, total, quota_notice)
+
+    if starting_quota and ending_quota:
+        try:
+            used_this_run = (
+                int(starting_quota.get("total_searches_left", 0)) -
+                int(ending_quota.get("total_searches_left", 0))
+            )
+            left_after = int(ending_quota.get("total_searches_left", 0))
+            monthly    = int(ending_quota.get("searches_per_month", 0))
+            log.info(
+                "SerpAPI usage this run: %d searches | %d remaining of %d/month "
+                "| %d rate-limit/quota errors during run",
+                used_this_run, left_after, monthly, _SERPAPI_ERROR_COUNT,
+            )
+            # Warn in logs if quota is running low — gives Trevor a heads-up
+            # to either reduce queries or ask the CEO about a paid plan.
+            if monthly > 0:
+                pct_left = 100.0 * left_after / monthly
+                if pct_left < 10:
+                    log.warning(
+                        "SerpAPI quota CRITICAL — only %d searches (%.0f%%) left "
+                        "for the month. Next run may fail. Time to consider upgrading.",
+                        left_after, pct_left,
+                    )
+                elif pct_left < 25:
+                    log.warning(
+                        "SerpAPI quota LOW — %d searches (%.0f%%) left for the month.",
+                        left_after, pct_left,
+                    )
+        except (ValueError, TypeError):
+            pass
+
     log.info("Done.")
 
 
 if __name__ == "__main__":
     main()
+
